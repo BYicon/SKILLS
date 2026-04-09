@@ -1,0 +1,4 @@
+interface:
+  display_name: "项目上下文初始化"
+  short_description: "审计真实仓库结构并初始化统一的 AI 首读文档体系"
+  default_prompt: "使用 $project-context-bootstrap 审计当前仓库，并初始化 AGENTS.md 与供 AI 首读的项目上下文文档。"
