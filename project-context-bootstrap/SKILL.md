@@ -52,6 +52,12 @@ description: "审计真实仓库结构后，初始化 AGENTS.md 与供 AI 首读
 
 在起草或重构这些文件前，先阅读 `references/templates.md`。
 
+如果用户提供了稳定的通用约束，先阅读 `references/general-conventions.md`，再按类型分流：
+
+- 代理执行约束、阅读顺序、硬约束入口规则，落到 `AGENTS.md`
+- 代码结构、实现策略、长期协作约定，落到 `docs/CONVENTIONS.md`
+- 如果与目标仓库现有规范冲突，以仓库现状和团队规则为准，不要强行覆盖
+
 ### 3. 打通入口文件
 
 更新仓库入口文件，让后续会话无需重新审计即可发现这些文档：
