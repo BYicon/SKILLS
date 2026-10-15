@@ -1,0 +1,37 @@
+# Operating system and editor files
+.DS_Store
+._*
+*.swp
+*.swo
+
+# Local tooling and generated output
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/.local/
+/local/
+/private/
+/dist/
+*.log
+
+# Environment files; examples must contain placeholders only
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Credentials, key stores, and common tool authentication files
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+auth.json
+credentials.json
+service-account*.json
+.netrc
+.npmrc
