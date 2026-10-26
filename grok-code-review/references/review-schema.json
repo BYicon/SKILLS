@@ -1,0 +1,57 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "coverage", "findings", "verifications"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1, "maxLength": 6000},
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete", "missing_context"],
+      "properties": {
+        "complete": {"type": "boolean"},
+        "missing_context": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 100}
+      }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "severity", "path", "side", "start_line", "end_line", "title", "trigger", "expected", "actual", "impact", "evidence", "recommendation", "assumptions"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^G-[0-9]{3,}$"},
+          "kind": {"type": "string", "enum": ["defect", "suggestion"]},
+          "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+          "path": {"type": "string", "minLength": 1},
+          "side": {"type": "string", "enum": ["before", "after"]},
+          "start_line": {"type": "integer", "minimum": 1},
+          "end_line": {"type": "integer", "minimum": 1},
+          "title": {"type": "string", "minLength": 1, "maxLength": 300},
+          "trigger": {"type": "string", "minLength": 1},
+          "expected": {"type": "string", "minLength": 1},
+          "actual": {"type": "string", "minLength": 1},
+          "impact": {"type": "string", "minLength": 1},
+          "evidence": {"type": "string", "minLength": 1},
+          "recommendation": {"type": "string", "minLength": 1},
+          "assumptions": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 100}
+        }
+      }
+    },
+    "verifications": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "reason"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^G-[0-9]{3,}$"},
+          "status": {"type": "string", "enum": ["resolved", "unresolved", "insufficient_context"]},
+          "reason": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}
