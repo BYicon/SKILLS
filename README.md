@@ -7,7 +7,7 @@
 | Skill | 用途 |
 | --- | --- |
 | [project-context-bootstrap](project-context-bootstrap/SKILL.md) | 审计仓库结构，初始化 AGENTS.md 和 AI 项目上下文文档 |
-| [ui-no-ai](ui-no-ai/SKILL.md) | 实现、改造或评审前端页面，去AI味儿，改善信息结构、视觉和交互 |
+| [ui-no-ai](ui-no-ai/SKILL.md) | 设计、实现或评审专业界面，改善构图、视觉层级、排版与交互，减少模板感 |
 
 ## 安装与使用
 
