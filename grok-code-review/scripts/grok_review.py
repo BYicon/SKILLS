@@ -8,14 +8,17 @@ import difflib
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import selectors
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 
@@ -23,6 +26,8 @@ SKILL = Path(__file__).resolve().parents[1]
 SCHEMA = SKILL / "references/review-schema.json"
 FILE_LIMIT = 128 * 1024
 TOTAL_LIMIT = 512 * 1024
+CLI_FRAME_LIMIT = 4 * 1024 * 1024
+PROGRESS_INTERVAL = 10
 BLOCKED_DIRS = {".git", ".grok", ".claude", ".codex", ".agents", "node_modules", ".venv", "__pycache__"}
 BLOCKED_NAMES = {"auth.json", "credentials.json", ".netrc", ".npmrc", "id_rsa", "id_ed25519"}
 SECRET_PATTERNS = [
@@ -79,6 +84,170 @@ def load(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (ValueError, UnicodeError, OSError):
         raise ReviewError(f"无法读取 JSON：{path.name}") from None
+
+
+def execution_timeout(value):
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("超时必须为非负秒数，0表示不限制。") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("超时必须为非负秒数，0表示不限制。")
+    return seconds or None
+
+
+class ReviewProgress:
+    """Persist only whitelisted metadata, never model text, tool contents or stderr."""
+
+    def __init__(self, path):
+        self.path = path
+        self.started = time.monotonic()
+        self.last_saved = self.started
+        self.last_output = None
+        self.data = {"status": "running", "stage": "starting", "updates": 0, "characters": 0,
+                     "responses": 0, "tool_calls": 0, "tool_results": 0, "tool_errors": 0,
+                     "stderr_bytes": 0}
+        self.flush(force=True)
+
+    def flush(self, *, force=False):
+        current = time.monotonic()
+        if force or current - self.last_saved >= PROGRESS_INTERVAL:
+            save(self.path, {**self.data, "updated_at": now(),
+                             "elapsed_seconds": round(current - self.started, 2),
+                             "last_output_elapsed_seconds": self.last_output})
+            self.last_saved = current
+
+    def event(self, stage, **fields):
+        self.data.update(stage=stage, **fields)
+        self.flush(force=True)
+
+    def output(self):
+        self.last_output = round(time.monotonic() - self.started, 2)
+
+    def stderr(self, chunk):
+        self.data["stderr_bytes"] += len(chunk)
+        # Categories describe transport failures without retaining any diagnostic text.
+        lower = chunk.lower()
+        categories = set(self.data.get("diagnostic_categories", []))
+        for category, words in {"permission": (b"permission", b"denied"),
+                                "auth": (b"unauthenticated", b"authentication failed", b"not logged in"),
+                                "rate_limit": (b"429", b"rate limit", b"too many requests"),
+                                "network": (b"timeout", b"timed out", b"websocket", b"connection failed")}.items():
+            if any(word in lower for word in words):
+                categories.add(category)
+        self.data["diagnostic_categories"] = sorted(categories)
+        self.flush()
+
+    def message(self, value):
+        require(isinstance(value, dict), "CLI 流式事件不是 JSON 对象；未保存原始输出。")
+        kind = value.get("type")
+        require(isinstance(kind, str), "CLI 流式事件缺少有效类型；未保存原始输出。")
+        if kind == "stream_event":
+            event = value.get("event")
+            delta = event.get("delta") if isinstance(event, dict) else None
+            self.data["updates"] += 1
+            if isinstance(delta, dict):
+                self.data["characters"] += sum(len(delta[key]) for key in ("text", "thinking", "partial_json") if isinstance(delta.get(key), str))
+            self.data["stage"] = "model_activity"
+            self.flush()
+        elif kind == "system" and value.get("subtype") == "init":
+            self.event("session_initialized")
+        elif kind in {"assistant", "user"}:
+            message = value.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if kind == "assistant":
+                self.data["responses"] += 1
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                if kind == "assistant" and block.get("type") == "tool_use":
+                    self.data["tool_calls"] += 1
+                    name = block.get("name")
+                    self.data["last_tool"] = name if isinstance(name, str) and name in {"read_file", "grep", "list_dir"} else "other"
+                if kind == "user" and block.get("type") == "tool_result":
+                    self.data["tool_results"] += 1
+                    self.data["tool_errors"] += int(bool(block.get("is_error")))
+            self.event("model_response" if kind == "assistant" else "tool_finished")
+        elif kind == "error":
+            self.event("cli_error")
+
+
+def receive_review(process, timeout, progress):
+    """Consume Messages JSON without retaining reasoning or raw output."""
+    final = None
+    buffer = bytearray()
+    started = time.monotonic()
+
+    def consume(line):
+        nonlocal final
+        if not line.strip():
+            return
+        require(len(line) <= CLI_FRAME_LIMIT, "CLI 单条事件超过输出上限。")
+        try:
+            value = json.loads(line)
+        except (ValueError, UnicodeError):
+            raise ReviewError("CLI 流式输出不是完整 JSON 事件；未保存原始输出。") from None
+        progress.message(value)
+        if value.get("type") == "result":
+            require(final is None, "CLI 返回多个最终结果，停止自动处理。")
+            require(value.get("subtype") == "success" and value.get("is_error") is False,
+                    "Grok 返回失败结果；未保存原始错误，不自动重发。")
+            final = {"text": value.get("result"), "stopReason": value.get("stop_reason"),
+                     "sessionId": value.get("session_id"), "usage_is_incomplete": True}
+            if "structured_output" in value:
+                final["structured_output"] = value["structured_output"]
+            # Messages usage has mandatory numeric defaults but no completeness marker.
+            # Do not turn unknown zero buckets or fallback costs into billing evidence.
+            progress.event("result_received", status="validating")
+
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            while selector.get_map() or process.poll() is None:
+                remaining = None if timeout is None else timeout - (time.monotonic() - started)
+                if remaining is not None and remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, timeout)
+                events = selector.select(1 if remaining is None else min(1, remaining))
+                if not events and process.poll() is not None:
+                    break
+                for key, _ in events:
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    progress.output()
+                    if key.data == "stderr":
+                        progress.stderr(chunk)
+                        continue
+                    buffer.extend(chunk)
+                    while b"\n" in buffer:
+                        line, _, rest = buffer.partition(b"\n")
+                        buffer = rest
+                        consume(line)
+                    require(len(buffer) <= CLI_FRAME_LIMIT, "CLI 单条事件超过输出上限。")
+                progress.flush()
+            if buffer:
+                consume(buffer)
+        code = process.wait()
+        progress.event("process_exited", exit_code=code)
+        require(code == 0, f"Grok CLI 失败（退出码 {code}）；请检查阶段记录。不自动重发，未保存原始输出。")
+        require(final is not None, "Grok 已退出但未返回完整最终结果；不自动重发。")
+        return final
+    finally:
+        process.stdout.close()
+        process.stderr.close()
+
+
+def stop_review(process):
+    if process and process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    if process:
+        process.stdout.close()
+        process.stderr.close()
 
 
 def git(repo, *args, optional=False, stdin=None):
@@ -258,6 +427,10 @@ def opened(args):
     state = load(run / "manifest.json")
     require(state.get("version") == 1, "不支持的审核状态版本。")
     require(str(repo) == state["repo"], "当前项目与审核记录中的项目不一致。")
+    if args.command == "status":
+        # Status is read-only and must remain usable while review owns the lock.
+        yield run, state
+        return
     with (run / "run.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -331,7 +504,7 @@ def prepare(args):
              "mode": "review" if args.commit else args.mode,
              "scope": {"base": base, "head": pinned, "paths": [relative(p) for p in args.path]},
              "context": [relative(p) for p in args.context], "model": args.model,
-             "policy": {"max_rechecks": 2, "max_attempts": 4, "timeout": 300, "max_turns": 20},
+             "policy": {"max_rechecks": 2, "max_attempts": 4, "timeout": args.timeout, "max_turns": 20},
              "rounds": [], "session_id": None}
     targets = target_paths(repo, state)
     require(targets, "审核范围没有改动；全文审核请显式指定 --path。")
@@ -433,7 +606,7 @@ def validate_response(payload, run, state, snapshot, known):
 
 def extract(stdout):
     try:
-        envelope = json.loads(stdout)
+        envelope = stdout if isinstance(stdout, dict) else json.loads(stdout)
         require(isinstance(envelope, dict), "CLI 返回结果不是 JSON 对象。")
         require(envelope.get("stopReason", envelope.get("stop_reason")) == "end_turn", "CLI 没有正常完成，不能把部分输出当作审核通过。")
         payload = envelope.get("structured_output", envelope.get("structuredOutput"))
@@ -479,6 +652,8 @@ def review(args, run, state):
     if completed:
         require(all(v["verdict"] != "unassessed" for v in ledger["issues"].values()), "复审前先完成 Codex 的逐项核实。")
     phase = "recheck" if completed else "initial"
+    timeout = args.timeout if hasattr(args, "timeout") else state["policy"].get("timeout")
+    require(timeout is None or (type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0), "执行超时配置无效；请用 --timeout 0 取消或指定正秒数。")
     workspace = run / "workspace"
     if workspace.exists():
         shutil.rmtree(workspace)
@@ -503,10 +678,11 @@ path 使用仓库相对路径，不包含 before/ 或 after/ 前缀；side 明�
 """
     number = len(state["rounds"]) + 1
     prompt_path = run / f"round-{number:02d}.prompt.md"
+    progress_path = run / f"round-{number:02d}.progress.json"
     write(prompt_path, prompt)
     executable = shutil.which(args.grok)
     require(executable is not None, "找不到 Grok CLI，请先安装并登录。")
-    command = [executable, "--cwd", str(workspace), "--prompt-file", str(prompt_path), "--output-format", "json",
+    command = [executable, "--cwd", str(workspace), "--prompt-file", str(prompt_path), "--output-format", "streaming-messages-json", "--include-partial-messages",
                "--json-schema", json.dumps(load(SCHEMA), ensure_ascii=False),
                "--tools", "read_file,grep,list_dir", "--permission-mode", "dontAsk",
                "--deny", "Bash", "--deny", "Edit", "--deny", "Write", "--deny", "MCPTool",
@@ -516,24 +692,23 @@ path 使用仓库相对路径，不包含 before/ 或 after/ 前缀；side 明�
     if completed:
         command += ["--resume", state["session_id"]]
     if not args.send:
-        print(encoded({"sent": False, "phase": phase, "snapshot_id": state["snapshot_id"], "workspace": str(workspace), "prompt": str(prompt_path), "next": "审阅材料与有效权限后，加 --send 才会调用 CLI。"}))
+        print(encoded({"sent": False, "phase": phase, "snapshot_id": state["snapshot_id"], "workspace": str(workspace), "prompt": str(prompt_path), "progress": str(progress_path), "timeout_seconds": timeout, "next": "审阅材料与有效权限后，加 --send 才会调用 CLI。"}))
         return
-    item = {"number": number, "phase": phase, "snapshot_id": state["snapshot_id"], "fingerprint": snapshot["fingerprint"], "status": "running", "started_at": now()}
+    item = {"number": number, "phase": phase, "snapshot_id": state["snapshot_id"], "fingerprint": snapshot["fingerprint"], "status": "running", "started_at": now(), "timeout_seconds": timeout}
     state["rounds"].append(item)
     save(run / "manifest.json", state)
     env = {**os.environ, "GROK_MEMORY": "0", "GROK_DISABLE_AUTOUPDATER": "1"}
     process = None
+    progress = None
     try:
+        progress = ReviewProgress(progress_path)
         version = subprocess.run([executable, "--version"], capture_output=True, timeout=10).stdout.decode("utf-8").strip()
         scan(version, "CLI 版本")
         item["cli_version"] = version[:200]
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=workspace, start_new_session=True)
         item["pid"] = process.pid
         save(run / "manifest.json", state)
-        stdout, _ = process.communicate(timeout=state["policy"]["timeout"])
-        require(process.returncode == 0, f"Grok CLI 失败（退出码 {process.returncode}）；请检查本机认证或网络。未保存原始输出。")
-        require(len(stdout) <= 4 * 1024 * 1024, "CLI 输出超过上限。")
-        envelope, payload, session = extract(stdout)
+        envelope, payload, session = extract(receive_review(process, timeout, progress))
         require(not completed or session == state["session_id"], "复审返回了不同的会话 ID，停止自动处理。")
         validate_response(payload, run, state, snapshot, known)
         stable(run, state)
@@ -549,16 +724,19 @@ path 使用仓库相对路径，不包含 before/ 或 after/ 前缀；side 明�
         save(run / "decisions.json", ledger)
         item.update(status="completed", session_id=session, finished_at=now(), usage=usage)
         state["session_id"] = session
-    except (subprocess.TimeoutExpired, KeyboardInterrupt):
-        if process and process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
-        item.update(status="failed", error="调用超时或被中断；不自动重发，调用尝试已计数。", finished_at=now())
+        progress.event("validated", status="completed")
+    except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+        stop_review(process)
+        reason = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "interrupted"
+        if progress:
+            progress.event(reason, status="failed")
+        message = "调用达到显式设置的执行时限。" if reason == "timeout" and process else "CLI 版本检查超时。" if reason == "timeout" else "调用被人工中断。"
+        item.update(status="failed", error=message + "不自动重发，调用尝试已计数。", finished_at=now())
         raise ReviewError(item["error"]) from None
     except (ReviewError, OSError, subprocess.SubprocessError) as exc:
-        if process and process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
+        stop_review(process)
+        if progress:
+            progress.event("failed", status="failed")
         if not isinstance(exc, ReviewError):
             exc = ReviewError("CLI 进程调用失败；未保存原始输出。")
         item.update(status="failed", error=str(exc), finished_at=now())
@@ -566,10 +744,10 @@ path 使用仓库相对路径，不包含 before/ 或 after/ 前缀；side 明�
     finally:
         save(run / "manifest.json", state)
         report(run, state)
-    print(encoded({"status": item["status"], "phase": phase, "session_id": state["session_id"], "report": str(run / f"round-{number:02d}.grok.md")}))
+    print(encoded({"status": item["status"], "phase": phase, "session_id": state["session_id"], "report": str(run / f"round-{number:02d}.grok.md"), "progress": str(progress_path)}))
 
 
-def report(run, state):
+def report(run, state, *, persist=True):
     known, completed = history(run, state)
     ledger = decisions(run, known)
     reasons, pending = [], []
@@ -634,9 +812,36 @@ def report(run, state):
     if payload:
         result += ["", "## Grok 报告的上下文缺口", ""] + [f"- {md(x)}" for x in payload["coverage"]["missing_context"]]
     result += ["", "## 调用记录", ""]
-    result += [f"- round-{r['number']:02d} / {r['phase']} / {r['snapshot_id']} / {r['status']}：{md(r.get('error', r.get('cli_version', '')))}" for r in state["rounds"]]
-    write(run / "final.md", "\n".join(result) + "\n")
+    for item in state["rounds"]:
+        timeout = item.get("timeout_seconds", state["policy"].get("timeout"))
+        limit = "不限制" if timeout is None else f"{timeout:g}秒"
+        result.append(f"- round-{item['number']:02d} / {item['phase']} / {item['snapshot_id']} / {item['status']} / 执行超时{limit}：{md(item.get('error', item.get('cli_version', '')))}")
+    if persist:
+        write(run / "final.md", "\n".join(result) + "\n")
     return status
+
+
+def status(run, state):
+    latest = state["rounds"][-1] if state["rounds"] else None
+    path = run / f"round-{latest['number']:02d}.progress.json" if latest else None
+    progress = load(path) if path and path.is_file() else None
+    if latest and latest["status"] == "running":
+        alive = None
+        if latest.get("pid"):
+            try:
+                os.kill(latest["pid"], 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                pass
+        return {"status": "未完成" if alive is False else "运行中", "snapshot_id": state["snapshot_id"],
+                "round": latest["number"], "process_alive": alive,
+                "timeout_seconds": latest.get("timeout_seconds", state["policy"].get("timeout")),
+                "progress": progress, "progress_file": str(path) if path else None,
+                "next": "进程状态待核查，不自动重发。" if alive is False else "等待完整结果、正常退出和校验；进度计数不代表完成。"}
+    return {"status": report(run, state, persist=False), "snapshot_id": state["snapshot_id"],
+            "report": str(run / "final.md"), "session_id": state["session_id"], "progress": progress}
 
 
 def parser():
@@ -653,6 +858,7 @@ def parser():
     first.add_argument("--mode", choices=("fix", "review"), default="fix")
     first.add_argument("--model", help="传给 CLI 的模型标识；省略则使用其配置")
     first.add_argument("--run-dir", help="可选的新建运行目录，必须在所有 Git 工作区之外")
+    first.add_argument("--timeout", type=execution_timeout, default=None, help="默认不限制执行时间；正数设置秒数，0表示不限制")
     for name in ("refresh", "review", "report", "status"):
         command = sub.add_parser(name)
         command.add_argument("run")
@@ -662,6 +868,7 @@ def parser():
         if name == "review":
             command.add_argument("--send", action="store_true", help="实际调用 CLI；缺省只生成待检查材料")
             command.add_argument("--grok", default="grok", help="CLI 可执行文件；便于本地兼容验证")
+            command.add_argument("--timeout", type=execution_timeout, default=argparse.SUPPRESS, help="仅覆盖本次调用的执行时限（秒）；0表示不限制，省略沿用运行记录")
     return result
 
 
@@ -680,9 +887,11 @@ def main():
             print(encoded({"snapshot_id": state["snapshot_id"], "fingerprint": snapshot["fingerprint"], "omissions": snapshot["omissions"], "sent": False}))
         elif args.command == "review":
             review(args, run, state)
+        elif args.command == "status":
+            print(encoded(status(run, state)))
         else:
-            status = report(run, state)
-            print(encoded({"status": status, "snapshot_id": state["snapshot_id"], "report": str(run / "final.md"), "session_id": state["session_id"]}))
+            result_status = report(run, state)
+            print(encoded({"status": result_status, "snapshot_id": state["snapshot_id"], "report": str(run / "final.md"), "session_id": state["session_id"]}))
 
 
 def interrupted(*_):

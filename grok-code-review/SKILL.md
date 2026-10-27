@@ -28,6 +28,8 @@ python3 "$SKILL_DIR/scripts/grok_review.py" prepare \
 
 保存输出的 `run` 为 `RUN`。脚本只写仓库外运行目录，不修改业务代码、不调用 Grok。它创建版本快照、差异、遗漏清单和裁决台账；`--context` 可重复添加必要的相对上下文路径。分支模式以共同祖先为基准，包含当前工作区最终内容。符号链接、子模块、二进制、敏感路径及超限材料不会被复制，遗漏会阻止报告声称完整通过。
 
+默认不限制单次审核执行时间。需要时在 `prepare` 显式传 `--timeout 秒数` 保存到本次运行；`review --timeout 秒数` 仅覆盖该次调用，`--timeout 0` 表示不限制。旧运行仍沿用其已保存的时限；取消旧时限时显式传 `review ... --timeout 0`，不手改历史记录。
+
 ```bash
 python3 "$SKILL_DIR/scripts/grok_review.py" review "$RUN" --repo "$REPO"
 ```
@@ -42,7 +44,17 @@ python3 "$SKILL_DIR/scripts/grok_review.py" review "$RUN" --repo "$REPO"
 python3 "$SKILL_DIR/scripts/grok_review.py" review "$RUN" --repo "$REPO" --send
 ```
 
-脚本使用文件提示词、结构化输出、读取工具白名单以及 shell/编辑/MCP 拒绝规则，关闭网页搜索和子代理。读取 `round-XX.grok.md`，同时以对应 JSON 和具体代码为依据。CLI 的 JSON 外层是运行封装，不能直接当作问题列表；解析失败、异常结束或无效行号均算未完成。
+脚本使用文件提示词、结构化输出、读取工具白名单以及 shell/编辑/MCP 拒绝规则，关闭网页搜索和子代理。CLI 必须支持 `streaming-messages-json` 和 `--include-partial-messages`。脚本只记录阶段、计数和错误分类，不保存原始输出、内部推理或工具内容；每轮的 `round-XX.progress.json` 提供当前进度。
+
+将长调用保留在可继续等待的后台会话中；工具等待窗口结束只表示暂时让出控制，不是审核执行超时。期间用下列只读命令查询状态，不重复发送审核请求：
+
+```bash
+python3 "$SKILL_DIR/scripts/grok_review.py" status "$RUN" --repo "$REPO"
+```
+
+`elapsed_seconds` 是当前调用历时，`last_output_elapsed_seconds` 是最近收到数据时的相对时刻，二者不同；定期更新状态文件不代表模型有新输出。没有新数据时检查进程及错误分类，不能仅凭耗时宣称完成或自动重发。只有终端结果正常结束、进程退出码为0、完整审核结构及当前材料校验通过后，状态才是 `completed`。人工取消和显式设置的超时仍会停止当前进程组并保留失败记录。
+
+完成后读取 `round-XX.grok.md`，同时以对应 JSON 和具体代码为依据。CLI 的 JSON 外层是运行封装，不能直接当作问题列表；解析失败、异常结束或无效行号均算未完成。
 
 ### 3. 独立核实并修复
 
@@ -73,7 +85,7 @@ python3 "$SKILL_DIR/scripts/grok_review.py" status "$RUN" --repo "$REPO"
 python3 "$SKILL_DIR/scripts/grok_review.py" report "$RUN" --repo "$REPO"
 ```
 
-默认最多两轮成功复审、四次实际调用尝试，每次最多 300 秒和 20 个 CLI agent 轮次；失败也占尝试次数。脚本不自动重发不明结果，不自动提高上限。耗尽时交付已完成内容与剩余问题；继续增加预算需用户明确要求。
+默认最多两轮成功复审、四次实际调用尝试，每次最多20个 CLI agent 轮次；没有默认的总执行时间或空闲中断时限，失败也占尝试次数。脚本不自动重发不明结果，不自动提高调用及轮次上限。耗尽时交付已完成内容与剩余问题；继续增加调用预算需用户明确要求。
 
 只有范围完整、确定问题已处理、当前快照相关验证通过且 Grok 确认修复，才能报告修复通过。无须修复的初审可以作为代码审查通过；仅审核模式发现缺陷应标明“发现问题”。存在待确认、覆盖缺口、失败检查或运行失败时如实报告。
 
