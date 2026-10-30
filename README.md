@@ -8,7 +8,7 @@
 | --- | --- |
 | [project-context-bootstrap](project-context-bootstrap/SKILL.md) | 审计仓库结构，建立或系统重建 AGENTS.md 和 AI 项目上下文文档体系 |
 | [agents-md-optimizer](agents-md-optimizer/SKILL.md) | 审查和局部优化现有项目指令，排查冲突、冗余与加载不生效 |
-| [ui-no-ai](ui-no-ai/SKILL.md) | 以成熟产品完成度设计、实现和评审界面，统筹 UI、UX 与工程，并通过实际画面和交互验证 |
+| [ui-ux-design](ui-ux-design/SKILL.md) | 以成熟产品完成度设计、实现和评审界面，统筹 UI、UX 与工程，并通过实际画面和交互验证 |
 | [grok-code-review](grok-code-review/SKILL.md) | 调用本机 Grok CLI 审核代码并生成报告，由 Codex 核实、修复和复审 |
 
 ## 安装与使用
@@ -22,7 +22,7 @@
 ```text
 $project-context-bootstrap 审计当前仓库并初始化项目上下文文档
 $agents-md-optimizer 审查现有项目规则，精简冗余并排查 AGENTS.md 加载问题
-$ui-no-ai 优化当前页面的信息层级和操作流程
+$ui-ux-design 优化当前页面的信息层级和操作流程
 $grok-code-review 审核当前改动，修复确定问题，不确定事项集中询问我
 ```
 
